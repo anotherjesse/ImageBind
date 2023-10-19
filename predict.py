@@ -1,8 +1,14 @@
 # Prediction interface for Cog ⚙️
 # https://github.com/replicate/cog/blob/main/docs/python.md
 
+import re
+import sys
+import requests
+import tempfile
+from io import BytesIO
 from typing import List, Optional
-from cog import BasePredictor, Input, Path
+from PIL import Image
+from cog import BasePredictor, Input, Path, BaseModel
 import data
 import torch
 from models import imagebind_model
@@ -14,6 +20,9 @@ MODALITY_TO_PREPROCESSING = {
     ModalityType.AUDIO: data.load_and_transform_audio_data,
 }
 
+class NamedEmbedding(BaseModel):
+    input: str
+    embedding: List[float]
 
 class Predictor(BasePredictor):
     def setup(self):
@@ -24,46 +33,48 @@ class Predictor(BasePredictor):
 
     def predict(
         self,
-        input: Path = Input(
-            description="file that you want to embed. Needs to be text, vision, or audio.",
-            default=None,
+        inputs: str = Input(
+            description="Newline-separated inputs. Can either be strings of text or image URIs starting with http[s]://",
+            default='',
         ),
-        text_input: str = Input(
-            description="text that you want to embed. Provide a string here instead of a text file to input if you'd like.",
-            default=None,
-        ),
-        modality: str = Input(
-            description="modality of the input you'd like to embed",
-            choices=list(MODALITY_TO_PREPROCESSING.keys()),
-            default=ModalityType.VISION,
-        ),
-    ) -> List[float]:
-        """Infer a single embedding with the model"""
-
-        if not input and not text_input:
-            raise Exception(
-                "Neither input nor text_input were provided! Provide one in order to generate an embedding"
-            )
-
-        modality_function = MODALITY_TO_PREPROCESSING[modality]
-
-        if modality == "text":
-            if input and text_input:
-                raise Exception(
-                    f"Input and text_input were both provided! Only provide one to generate an embedding.\nInput provided: {input}\nText Input provided: {text_input}"
-                )
-            if text_input:
-                input = text_input
-            else:
-                with open(input, "r") as f:
-                    text_input = f.readlines()
-                input = text_input
-
+    ) -> List[NamedEmbedding]:
         device = "cuda"
-        model_input = {modality: modality_function([input], device)}
+        outputs = []
 
-        with torch.no_grad():
-            embeddings = self.model(model_input)
-        # print(type(embeddings))
-        emb = embeddings[modality]
-        return emb.cpu().squeeze().tolist()
+        for line in inputs.strip().splitlines():
+            line = line.strip()
+
+            if re.match("^https?://", line):
+                try:
+                    url = line
+                    print(f"Downloading {url}", file=sys.stderr)
+                    response = requests.get(url)
+                    with tempfile.NamedTemporaryFile(delete=True) as tmp_file:
+                        tmp_file.write(response.content)
+
+                        modality_function = MODALITY_TO_PREPROCESSING['vision']
+                        model_input = {'vision': modality_function([tmp_file.name], device)}
+
+                        with torch.no_grad():
+                            embeddings = self.model(model_input)
+
+                        emb = embeddings['vision']
+                        outputs.append(
+                            NamedEmbedding(input=line, embedding=emb.cpu().squeeze().tolist())
+                        )
+
+                except Exception as e:
+                    print(f"Failed to load {line}: {e}", file=sys.stderr)
+            else:
+                modality_function = MODALITY_TO_PREPROCESSING['text']
+                model_input = {'text': modality_function([line], device)}
+
+                with torch.no_grad():
+                    embeddings = self.model(model_input)
+
+                emb = embeddings['text']
+                outputs.append(
+                    NamedEmbedding(input=line, embedding=emb.cpu().squeeze().tolist())
+                )
+
+        return outputs
